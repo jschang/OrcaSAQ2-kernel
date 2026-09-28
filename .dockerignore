@@ -1,0 +1,15 @@
+# Keep the build context lean. The Dockerfile only needs: rocm/, orcasaq2/, presets/,
+# pyproject.toml, README.md, docker/, and the two *.patch files under upstream/<name>/.
+# Everything else is local-only (debug artifacts, the nested upstream clones used to build the
+# PR branches, the CUDA debug tree, VCS metadata) and should not be shipped to the daemon.
+.git
+.gitignore
+.gitattributes
+.gitmodules
+orcasaq2_kernel.egg-info/
+third_party/
+dbg/
+dbg2/
+build/
+upstream/vllm/vllm/
+upstream/exllamav3/exllamav3/

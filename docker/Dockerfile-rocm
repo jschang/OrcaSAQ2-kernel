@@ -1,0 +1,58 @@
+# vLLM serving image for EXL3 (exllamav3 trellis) quantized checkpoints, for AMD GPUs (ROCm).
+#
+# Differences from the CUDA Dockerfile:
+#   * the ROCm base image ships no exllamav3 -- the project is CUDA-only and publishes no ROCm
+#     wheel -- so the four EXL3 GEMM functions the orcasaq2 plugin calls are built from source
+#     here, hipified, against this image's own ROCm torch. Building against the image's torch is
+#     what makes the ABI match at runtime, the same reason the CUDA image resolves its wheel from
+#     the base image's torch rather than pinning one.
+#   * there is no nvcc pinning step: the extension is compiled by the image's own hipcc (from
+#     ROCM_HOME), and vLLM's ROCm build does not JIT-compile through a separate CUDA toolkit, so
+#     there is nothing to pin down.
+ARG VLLM_TAG=v0.30.0
+FROM vllm/vllm-openai-rocm:${VLLM_TAG}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# The base image is stock vLLM v0.30.0, whose qwen3_next.py non-fused _project_qkv_gate -- the
+# path ROCm takes, since the fused path is CUDA-gated -- forwards the raw positions straight to
+# the RoPE kernel. When positions arrives 2-D (a (batch, seq) tensor, as vLLM passes for
+# multi-modal / profile runs) ROCm's RoPE kernel rejects it with:
+#   "query, key and positions must have the same batch_size and seq_len"
+# The fused (CUDA) branch already squeezes the batch dim with `positions = positions[0]`; the
+# non-fused branch did not, so it crashed on startup on ROCm. Apply that upstream fix so the
+# non-fused branch matches. It is a pure-Python one-liner, so no vLLM rebuild is required. The
+# patch is committed under upstream/vllm/ so the build stays reproducible without the
+# (gitignored) nested vllm clone.
+COPY upstream/vllm/0001-vllm-qwen3-next-rope-2d-positions.patch /tmp/qwen3_next_rope.patch
+RUN set -eux; \
+    patch -p1 -d /usr/local/lib/python3.12/dist-packages < /tmp/qwen3_next_rope.patch; \
+    rm -f /tmp/qwen3_next_rope.patch
+
+# Build and install the hipified EXL3 extension (rocm/setup.py -> exllamav3.ext.exllamav3_ext),
+# then the plugin. The build targets PYTORCH_ROCM_ARCH=gfx1100 only: the image default lists
+# eight arches, which is right for a redistributable wheel but would multiply this step ~8x for a
+# single-GPU image. --no-build-isolation makes the build use the image's own torch/setuptools/
+# ninja instead of a clean env that lacks them.
+COPY rocm /opt/exl3-rocm
+RUN PYTORCH_ROCM_ARCH=gfx1100 \
+    python3 -m pip install --no-cache-dir --no-build-isolation /opt/exl3-rocm
+
+# The plugin, installed so vLLM discovers it through the vllm.general_plugins entry point.
+# pyproject declares readme = "README.md", so that file has to come along or the build fails.
+COPY pyproject.toml README.md /opt/orcasaq2/
+COPY orcasaq2 /opt/orcasaq2/orcasaq2
+RUN python3 -m pip install --no-cache-dir --no-build-isolation /opt/orcasaq2 && rm -rf /opt/orcasaq2/*.egg-info
+
+# The presets and the launcher, so the container and the host build arguments from the same
+# script rather than from two copies that drift.
+COPY presets /opt/orcasaq2/presets
+
+# flashinfer is CUDA-only and absent from the ROCm image, so this is a no-op kept for parity with
+# the CUDA image.
+ENV VLLM_USE_FLASHINFER_SAMPLER=0
+COPY docker/entrypoint.sh /usr/local/bin/serve-exl3
+RUN chmod +x /usr/local/bin/serve-exl3 /opt/orcasaq2/presets/serve.sh
+
+EXPOSE 8000
+ENTRYPOINT ["/usr/local/bin/serve-exl3"]

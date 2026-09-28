@@ -5,3 +5,8 @@ build/
 dist/
 .venv/
 secrets/
+
+# Nested upstream checkouts (self-contained git repos holding the PR branches)
+upstream/vllm/vllm/
+upstream/exllamav3/exllamav3/
+third_party/vllm-rocm-debug/

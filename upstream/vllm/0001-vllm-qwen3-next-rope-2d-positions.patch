@@ -1,0 +1,23 @@
+diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
+index 495650e..3351272 100644
+--- a/vllm/model_executor/models/qwen3_next.py
++++ b/vllm/model_executor/models/qwen3_next.py
+@@ -442,6 +442,18 @@ class Qwen3NextAttention(nn.Module):
+         k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
+             -1, self.num_kv_heads * self.head_dim
+         )
++        # The fused branch above reduces 2-D positions to positions[0] for the
++        # non-mrope case: the profile/dummy run hands the layer positions of
++        # shape [num_reqs, seq_len] while q/k are already flattened to
++        # [num_tokens, hidden]. That fused branch is gated on
++        # current_platform.is_cuda(), so non-CUDA platforms (e.g. ROCm) always
++        # take this non-fused path and would otherwise feed the 2-D positions
++        # straight into the 1-D RoPE kernel, which aborts the engine's profile
++        # run. Apply the identical reduction here.
++        if positions.ndim == 2 and not getattr(
++            self.rotary_emb, "mrope_section", None
++        ):
++            positions = positions[0]
+         q, k = self.rotary_emb(positions, q, k)
+         return q, k, v, gate
+ 

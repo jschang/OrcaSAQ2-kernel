@@ -1,0 +1,18 @@
+--- a/exllamav3_ext/quant/exl3_dq.cuh
++++ b/exllamav3_ext/quant/exl3_dq.cuh
+@@ -305,7 +305,14 @@ __device__ __forceinline__ void dq_dispatch(const uint32_t* ptr, int idx, FragB&
+     }
+     else if constexpr (bits == 4)
+     {
+-        dq8_aligned_4bits<cb>(ptr, idx, frag0, frag1);
++        // The hand-optimized 4-bit path (dq8_aligned_4bits) miscompiles on ROCm/gfx1100: its
++        // portable FSHF_IMM funnel shift (the PTX shf.r replacement in ptx.cuh) extracts the
++        // wrong 16-bit windows, so the first 8 columns of every 16-column tile dequantize to the
++        // wrong codebook value. The K=2 path (BFE16_IMM + fshift, no FSHF_IMM) is unaffected,
++        // which localizes the fault to FSHF_IMM. The generic dq8<bits,cb,4> (align==4) computes
++        // bit-identical windows through fshift -- the same shift the working K=3 path uses --
++        // and matches CUDA exactly on this GPU, so route 4-bit rates through it.
++        dq8<bits, cb, 4>(ptr, idx, frag0, frag1);
+     }
+     else if constexpr (bits == 5)
+     {

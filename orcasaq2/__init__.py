@@ -90,8 +90,73 @@ def register():
         register_quantization_config("exl3")(Exl3Config)
     except ValueError:
         return  # already registered in this process
+    _patch_qwen35_mrope_config(logger)
     _patch_embedding_layers(logger)
     logger.info("orcasaq2 armed: quant_method 'exl3' is now loadable")
+
+
+def _copy_mrope_keys(src, dst):
+    """Preserve Qwen3.5 text mrope metadata that Transformers treats as unknown."""
+    top = getattr(src, "rope_parameters", None)
+    sub = getattr(dst, "rope_parameters", None)
+    if not isinstance(top, dict) or not isinstance(sub, dict):
+        return
+    for key in ("mrope_section", "mrope_interleaved"):
+        if key in top and key not in sub:
+            sub[key] = top[key]
+
+
+def _patch_qwen35_mrope_config(logger):
+    """Keep Qwen3.5's mrope section metadata on the text config vLLM actually uses.
+
+    Transformers warns that `mrope_section` and `mrope_interleaved` are unrecognized for
+    `rope_type=default` and drops them while building the text sub-config. vLLM's Qwen3Next
+    attention layer needs those fields to select the intended MRotaryEmbedding behavior, so
+    copy them through when the top-level config had them.
+    """
+    try:
+        from vllm.transformers_utils import config as vcfg
+    except Exception:
+        return
+
+    orig = vcfg.get_hf_text_config
+    if not getattr(orig, "_orca_mrope_patched", False):
+        def get_hf_text_config(config):
+            text_config = orig(config)
+            _copy_mrope_keys(config, text_config)
+            return text_config
+
+        get_hf_text_config._orca_mrope_patched = True
+        vcfg.get_hf_text_config = get_hf_text_config
+        try:
+            import vllm.config.model as model_config
+            if hasattr(model_config, "get_hf_text_config"):
+                model_config.get_hf_text_config = get_hf_text_config
+        except Exception:
+            pass
+
+    try:
+        import vllm.model_executor.models.qwen3_next as qwen3_next
+    except Exception:
+        logger.info("orcasaq2: Qwen3.5 mrope config preservation armed")
+        return
+
+    orig_init = qwen3_next.Qwen3NextAttention.__init__
+    if getattr(orig_init, "_orca_mrope_patched", False):
+        return
+
+    def attention_init(self, config, *args, **kwargs):
+        try:
+            from vllm.config import get_current_vllm_config
+            top_config = get_current_vllm_config().model_config.hf_config
+            _copy_mrope_keys(top_config, config)
+        except Exception:
+            pass
+        return orig_init(self, config, *args, **kwargs)
+
+    attention_init._orca_mrope_patched = True
+    qwen3_next.Qwen3NextAttention.__init__ = attention_init
+    logger.info("orcasaq2: Qwen3.5 mrope config metadata will be preserved")
 
 
 def _patch_embedding_layers(logger):

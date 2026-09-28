@@ -1,0 +1,4 @@
+positions.shape=(3, 2048) dim=2
+query.shape=(2048, 6144)
+key.shape=(2048, 1024)
+head_size=256
