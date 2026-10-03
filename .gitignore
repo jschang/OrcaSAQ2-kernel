@@ -10,3 +10,10 @@ secrets/
 upstream/vllm/vllm/
 upstream/exllamav3/exllamav3/
 third_party/vllm-rocm-debug/
+
+# hipify byproducts: the ROCm build compiles the rocm/exllamav3_ext/*.cu sources directly
+# with hipcc (rocm/setup.py), so the .hip files beside them are one-off hipify output kept
+# for reference, not build inputs.
+rocm/exllamav3_ext/*.hip
+rocm/exllamav3_ext/quant/*.hip
+rocm/exllamav3_ext/arch_hip.cuh

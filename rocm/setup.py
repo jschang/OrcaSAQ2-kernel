@@ -19,6 +19,9 @@ from torch.utils import cpp_extension
 # image; the Dockerfile pins this to the one arch we deploy on.
 archs = os.environ.get("PYTORCH_ROCM_ARCH", "gfx1100")
 
+# The inputs are the .cu files, compiled directly by hipcc: there is no hipify step. The
+# .hip files that sit beside them (and in quant/) are one-off hipify output, gitignored,
+# kept for reference only -- never a build input.
 sources = [
     "exllamav3_ext/bindings.cpp",
     "exllamav3_ext/rocm_gemm.cu",

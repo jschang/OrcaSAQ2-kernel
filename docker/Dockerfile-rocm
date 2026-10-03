@@ -14,6 +14,14 @@ FROM vllm/vllm-openai-rocm:${VLLM_TAG}
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Launch gotcha (ROCM-DEBUG-2.md session 4C): the first `import torch`/`import vllm` in a
+# stock container triggers a one-time build of tvm_ffi's optional torch-C-dlpack addon,
+# which forks hundreds of parallel compiles and can pin a box for >10 min (repeated
+# abandonment of the build left orphaned processes that froze the dev box). tvm_ffi checks
+# this env var and skips the build when it is set, so bake it into the image rather than
+# relying on every launcher to pass -e TVM_FFI_DISABLE_TORCH_C_DLPACK=1.
+ENV TVM_FFI_DISABLE_TORCH_C_DLPACK=1
+
 # The base image is stock vLLM v0.30.0, whose qwen3_next.py non-fused _project_qkv_gate -- the
 # path ROCm takes, since the fused path is CUDA-gated -- forwards the raw positions straight to
 # the RoPE kernel. When positions arrives 2-D (a (batch, seq) tensor, as vLLM passes for
