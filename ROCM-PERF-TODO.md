@@ -133,8 +133,19 @@ Result (done):
 - End-to-end (single stream, 24 GB gfx1100, MAXLEN=8192 MAXSEQS=1, no KV offload):
   ~16.2-16.3 tok/s (runs 16.29/16.26/16.21) vs prior 6.3-8.7 unfused -> ~2.3x. Decode
   runs at M=1 (cudagraph_capture_sizes=[1,2]) so the GEMV path is the one active.
-- Next (unmeasured): fuse reduce into the output-Hadamard epilogue; adaptive K_SPLIT for
-  narrow N; profile V3 to size the remaining GDN/attention term now that GEMM is fast.
+- Follow-up (ticket #10, done): `gemv_finalize` fuses the split-reduce and the output
+  128-point Hadamard (+ svh) into one kernel (replaces reduce + had_r_128 and the fp16 C
+  round trip); adaptive K_SPLIT (min(K/256, ceil(512/n_chunks)), walked to a divisor of
+  K/16) instead of always K/256; M=16 dispatches to the GEMV (wins 3 of 4 representative
+  shapes — gate -7.7%, down -7.1%, q -3.8%, qkv +3.5% — rows 9-144 stay unfused).
+  Per-op A/B vs the pre-follow-up build: M=8 qkv -16.5%, gate -20.5%, down -21.6%,
+  q -20.5% (adaptive splits); M=1 -1.4 to -7.0% (epilogue). Server (16 GB, single seq,
+  matched ~252-token prompt): GEMV family 48.71 -> 47.57 ms/tok, host gap 6.20 -> 4.95
+  ms/tok (404 fewer launches/step), wall 62.80 -> 61.48 ms/tok (15.9 -> 16.3 tok/s
+  profiled). Correctness cos=1.000000 all shapes.
+- Next (unmeasured): the partial kernels now read the packed trellis at ~0.71 TB/s
+  effective; GEMV is ~82% of GPU-busy, so the remaining GEMV lever is that read (wider
+  dequant / packed-FMA). Attention + GDN are the next largest terms per the #7 profile.
 
 ## P2 — deferred (deprioritized by the checkpoint histogram)
 
