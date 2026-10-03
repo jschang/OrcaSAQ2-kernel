@@ -7,9 +7,10 @@
 #include "quant/reconstruct.cuh"
 #include "quant/hadamard.cuh"
 
-// Fused decode GEMV (defined in rocm_gemv.cu): A_had @ dequant(trellis) without materializing
-// the (k, n) weight in HBM. A_had must already be the input Hadamard (+ suh); C is left for the
-// caller to Hadamard (+ svh).
+// Fused decode GEMV (defined in rocm_gemv.cu): had_svh(A_had @ dequant(trellis)) without
+// materializing the (k, n) weight in HBM. A_had must already be the input Hadamard (+ suh);
+// the output Hadamard (+ svh) is applied by the gemv_finalize epilogue, so C is complete on
+// return.
 void exl3_gemv
 (
     const half* A_had,
@@ -19,7 +20,8 @@ void exl3_gemv
     int size_k,
     float K,
     bool mcg,
-    bool mul1
+    bool mul1,
+    const half* svh
 );
 
 /*
@@ -118,10 +120,12 @@ int exl3_gemm
     had_r_128(A2, A_had2, suh, c10::nullopt, 1.0f);
 
     // 2+3. dequant + GEMM. For small M (decode) use the fused GEMV that dequants into shared
-    //      memory and dots in-kernel, so the (k, n) weight never touches HBM. Otherwise fall
-    //      back to reconstruct + rocBLAS.
+    //      memory and dots in-kernel, so the (k, n) weight never touches HBM; its finalize
+    //      epilogue also applies the output Hadamard (+ svh), so no step 4. Otherwise fall
+    //      back to reconstruct + rocBLAS + a separate output Hadamard. M=16 dispatches to the
+    //      GEMV as well; the rest of rows 9-144 stay unfused.
     const bool use_gemv = !c_fp32
-        && (size_m == 1 || size_m == 2 || size_m == 4 || size_m == 8)
+        && (size_m == 1 || size_m == 2 || size_m == 4 || size_m == 8 || size_m == 16)
         && (size_n % 128 == 0)
         && (size_k % 256 == 0);
     if (use_gemv)
@@ -130,17 +134,18 @@ int exl3_gemm
         // at::Half and HIP __half are bitwise identical.
         exl3_gemv(reinterpret_cast<const half*>(A_had2.data_ptr()), B,
                   reinterpret_cast<half*>(C.reshape({size_m, size_n}).data_ptr()),
-                  (int) size_m, size_k, K, mcg, mul1);
+                  (int) size_m, size_k, K, mcg, mul1,
+                  svh.has_value() ? (const half*) svh.value().data_ptr() : nullptr);
     }
     else
     {
         at::Tensor w = at::empty({size_k, size_n}, A.options());
         reconstruct(w, B, K, mcg, mul1);
         hgemm_recon(A_had2, w, C.reshape({size_m, size_n}));
-    }
 
-    // 4. output Hadamard, post-scaled by svh, in place
-    had_r_128(C.reshape({size_m, size_n}), C.reshape({size_m, size_n}), c10::nullopt, svh, 1.0f);
+        // 4. output Hadamard, post-scaled by svh, in place
+        had_r_128(C.reshape({size_m, size_n}), C.reshape({size_m, size_n}), c10::nullopt, svh, 1.0f);
+    }
 
     return 0;
 }

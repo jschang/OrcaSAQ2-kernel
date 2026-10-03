@@ -7,9 +7,13 @@
 // packed trellis is read.
 //
 // Two kernels:
-//   gemv_partial: split-K; each CTA owns (128 cols) x (16*GEMV_K_SPLIT rows), writes an fp32 partial.
-//   gemv_reduce:  sums the partials over the K splits -> fp16 C.
-// The input/output Hadamards (+ suh/svh) stay external (had_r_128), as in the unfused path.
+//   gemv_partial:  split-K; each CTA owns (128 cols) x (kt_max k-tiles of 16 rows), writes an
+//                  fp32 partial. The split count is adaptive (see exl3_gemv): just enough CTAs
+//                  to fill the device, since each split adds an HBM round trip of the partials.
+//   gemv_finalize: sums the partials over the K splits and runs the output 128-point Hadamard
+//                  (+ svh post-scale) in the same kernel -> fp16 C. Replaces the reduce kernel
+//                  plus the separate had_r_128 launch (and the fp16 C round trip between them).
+// The input Hadamard (+ suh) stays external (had_r_128), as in the unfused path.
 
 #include <hip/hip_fp16.h>
 #include <ATen/ATen.h>
@@ -20,12 +24,17 @@
 #include "ptx.cuh"
 #include "quant/reconstruct.cuh"
 #include "quant/hadamard.cuh"
+#include "quant/hadamard_inner.cuh"
 #include "quant/exl3_dq.cuh"
 #include "quant/bits_k.cuh"
+#include <algorithm>
 
 #define GEMV_THREADS 256
 #define GEMV_N_TILE 128   // 8 n-tiles of 16, per CTA
-#define GEMV_K_SPLIT 16   // 16-row k-tiles per CTA
+#define GEMV_K_SPLIT 16   // 16-row k-tiles per CTA at the maximum (K/256) split count
+// ~a full wave of the partial kernel: gfx1100 has 80 CUs x up to 8 workgroups = 640
+// concurrent CTAs; targeting 512 keeps every shape's CTA count near (not far above) one wave.
+#define GEMV_TARGET_CTAS 512
 
 // Dequant one 16(k) x 128(n) tile into row-major smem s_tile[16][8][8] (half2), reusing the exact
 // reconstruct_tile dequant + shuffle. g_packed points at the first of the 8 consecutive (k, n) tiles.
@@ -83,8 +92,8 @@ void gemv_dequant_tile
     __syncthreads();
 }
 
-// CTA: GEMV_THREADS (8 warps), GEMV_N_TILE (128) cols, 16*GEMV_K_SPLIT rows.
-// s_tile holds one 16x128 k-tile at a time; we dequant+dot it GEMV_K_SPLIT times, accumulating.
+// CTA: GEMV_THREADS (8 warps), GEMV_N_TILE (128) cols, kt_max 16-row k-tiles.
+// s_tile holds one 16x128 k-tile at a time; we dequant+dot it kt_max times, accumulating.
 // 2 threads per column split the 16 k-rows (8 each); per-column results combined via smem atomic.
 template <int K, int cb, bool HALF, int M>
 __global__ __launch_bounds__(GEMV_THREADS)
@@ -95,16 +104,16 @@ void gemv_partial_kernel
     float* __restrict__ g_c_partial,      // (splits, M, n_dim) fp32
     int k_dim,
     int n_dim,
-    int packed_blocks_n
+    int packed_blocks_n,
+    int kt_max                             // 16-row k-tiles owned by this CTA = (k_dim/16)/splits
 )
 {
     constexpr int packed_size = 16 * K + (HALF ? 8 : 0);
-    constexpr int KSPLIT = GEMV_K_SPLIT;
 
     int t = threadIdx.x;
     int lane_id = t % 32;
     int warp_id = t / 32;
-    int k0 = blockIdx.y * KSPLIT;                  // first 16-row k-tile index for this CTA
+    int k0 = blockIdx.y * kt_max;                  // first 16-row k-tile index for this CTA
     int n0 = blockIdx.x * (GEMV_N_TILE / 16);      // first n-tile index (8 per CTA)
 
     __shared__ uint32_t s_packed[8][packed_size / 2];
@@ -127,7 +136,7 @@ void gemv_partial_kernel
 
     g_packed += ((int64_t) k0 * packed_blocks_n + n0) * packed_size;
 
-    for (int kt = 0; kt < KSPLIT; kt++)
+    for (int kt = 0; kt < kt_max; kt++)
     {
         gemv_dequant_tile<K, cb, HALF>((half2*) s_tile, (uint32_t*) s_packed, g_packed, t, lane_id, warp_id);
         g_packed += (int64_t) packed_blocks_n * packed_size;
@@ -158,67 +167,117 @@ void gemv_partial_kernel
     }
 }
 
-// C_partial (splits, M, N) fp32 -> C (M, N) fp16, summing over the K splits.
-__global__
-void gemv_reduce_kernel
+// Fused split-K reduce + output-Hadamard epilogue.
+//
+// C_partial (splits, M, N) fp32 -> C (M, N) fp16, one CTA per (128-col block, row): each lane
+// sums its 4 owned columns (4*l .. 4*l+3) over the K splits, then runs the exact 128-point
+// Hadamard of had_hf_r_128_inner (4-point in-thread + 32-point warp shuffle), scales by
+// 1/sqrt(128), rounds to fp16, post-scales by svh in fp16 and stores the half4 -- the same
+// order of operations as the old reduce + had_r_128 pair, minus one launch and the fp16 C
+// round trip. (The fp16 C round trip also dropped one intermediate rounding, so the fused
+// result is marginally closer to the exact value.)
+template <bool post_scale>
+__global__ __launch_bounds__(32)
+void gemv_finalize_kernel
 (
     const float* __restrict__ g_c_partial,
     half* __restrict__ g_c,
+    const half* __restrict__ svh,
     int n_dim,
     int M,
     int splits
 )
 {
     int m = blockIdx.y;
-    int col = blockIdx.x * GEMV_N_TILE + threadIdx.x;
-    float sum = 0.0f;
+    int l = threadIdx.x;
+    int col0 = blockIdx.x * GEMV_N_TILE + 4 * l;
+
+    float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
     for (int s = 0; s < splits; s++)
-        sum += g_c_partial[((int64_t) s * M + m) * n_dim + col];
-    g_c[(int64_t) m * n_dim + col] = __float2half(sum);
+    {
+        const float* p = g_c_partial + ((int64_t) s * M + m) * n_dim + col0;
+        v0 += p[0];
+        v1 += p[1];
+        v2 += p[2];
+        v3 += p[3];
+    }
+
+    // 4 element had (had_hf_r_128_inner)
+    float s0 = v0 + v1;
+    float d0 = v0 - v1;
+    float s1 = v2 + v3;
+    float d1 = v2 - v3;
+    float h0 = s0 + s1;
+    float h1 = d0 + d1;
+    float h2 = s0 - s1;
+    float h3 = d0 - d1;
+
+    // 32 element had, warp shuffle (had_hf_r_128_inner)
+    shuffle_had_f4x32(h0, h1, h2, h3, l);
+    float r_scale = 0.088388347648f; // 1.0 / sqrt(128); caller passes scale 1.0
+    half2 x = __floats2half2_rn(h0 * r_scale, h1 * r_scale);
+    half2 y = __floats2half2_rn(h2 * r_scale, h3 * r_scale);
+
+    // Post scale (had_hf_r_128_inner)
+    if constexpr (post_scale)
+    {
+        int i = blockIdx.x * 32 + l;
+        half4 scales = ((half4*) svh)[i];
+        x = __hmul2(x, scales.x);
+        y = __hmul2(y, scales.y);
+    }
+
+    ((half2*) (g_c + (int64_t) m * n_dim + col0))[0] = x;
+    ((half2*) (g_c + (int64_t) m * n_dim + col0))[1] = y;
 }
 
-using GemvFn = void (*)(const half*, const uint16_t*, float*, int, int, int);
+using GemvFn = void (*)(const half*, const uint16_t*, float*, int, int, int, int);
 template <int K, int cb, bool HALF, int M>
 static GemvFn inst() { return (GemvFn) gemv_partial_kernel<K, cb, HALF, M>; }
 
 #define G__(k, c, m) (inst<k, c, false, m>())
-static const GemvFn gemv_plain[4][8] =
+static const GemvFn gemv_plain[5][8] =
 {
     { G__(1, 0, 1), G__(2, 0, 1), G__(3, 0, 1), G__(4, 0, 1), G__(5, 0, 1), G__(6, 0, 1), G__(7, 0, 1), G__(8, 0, 1) },
     { G__(1, 0, 2), G__(2, 0, 2), G__(3, 0, 2), G__(4, 0, 2), G__(5, 0, 2), G__(6, 0, 2), G__(7, 0, 2), G__(8, 0, 2) },
     { G__(1, 0, 4), G__(2, 0, 4), G__(3, 0, 4), G__(4, 0, 4), G__(5, 0, 4), G__(6, 0, 4), G__(7, 0, 4), G__(8, 0, 4) },
     { G__(1, 0, 8), G__(2, 0, 8), G__(3, 0, 8), G__(4, 0, 8), G__(5, 0, 8), G__(6, 0, 8), G__(7, 0, 8), G__(8, 0, 8) },
+    { G__(1, 0, 16), G__(2, 0, 16), G__(3, 0, 16), G__(4, 0, 16), G__(5, 0, 16), G__(6, 0, 16), G__(7, 0, 16), G__(8, 0, 16) },
 };
-static const GemvFn gemv_mcg[4][8] =
+static const GemvFn gemv_mcg[5][8] =
 {
     { G__(1, 1, 1), G__(2, 1, 1), G__(3, 1, 1), G__(4, 1, 1), G__(5, 1, 1), G__(6, 1, 1), G__(7, 1, 1), G__(8, 1, 1) },
     { G__(1, 1, 2), G__(2, 1, 2), G__(3, 1, 2), G__(4, 1, 2), G__(5, 1, 2), G__(6, 1, 2), G__(7, 1, 2), G__(8, 1, 2) },
     { G__(1, 1, 4), G__(2, 1, 4), G__(3, 1, 4), G__(4, 1, 4), G__(5, 1, 4), G__(6, 1, 4), G__(7, 1, 4), G__(8, 1, 4) },
     { G__(1, 1, 8), G__(2, 1, 8), G__(3, 1, 8), G__(4, 1, 8), G__(5, 1, 8), G__(6, 1, 8), G__(7, 1, 8), G__(8, 1, 8) },
+    { G__(1, 1, 16), G__(2, 1, 16), G__(3, 1, 16), G__(4, 1, 16), G__(5, 1, 16), G__(6, 1, 16), G__(7, 1, 16), G__(8, 1, 16) },
 };
-static const GemvFn gemv_mul1[4][8] =
+static const GemvFn gemv_mul1[5][8] =
 {
     { G__(1, 2, 1), G__(2, 2, 1), G__(3, 2, 1), G__(4, 2, 1), G__(5, 2, 1), G__(6, 2, 1), G__(7, 2, 1), G__(8, 2, 1) },
     { G__(1, 2, 2), G__(2, 2, 2), G__(3, 2, 2), G__(4, 2, 2), G__(5, 2, 2), G__(6, 2, 2), G__(7, 2, 2), G__(8, 2, 2) },
     { G__(1, 2, 4), G__(2, 2, 4), G__(3, 2, 4), G__(4, 2, 4), G__(5, 2, 4), G__(6, 2, 4), G__(7, 2, 4), G__(8, 2, 4) },
     { G__(1, 2, 8), G__(2, 2, 8), G__(3, 2, 8), G__(4, 2, 8), G__(5, 2, 8), G__(6, 2, 8), G__(7, 2, 8), G__(8, 2, 8) },
+    { G__(1, 2, 16), G__(2, 2, 16), G__(3, 2, 16), G__(4, 2, 16), G__(5, 2, 16), G__(6, 2, 16), G__(7, 2, 16), G__(8, 2, 16) },
 };
-static const GemvFn gemv_half[4][4] =
+static const GemvFn gemv_half[5][4] =
 {
     { (inst<1, 2, true, 1>()), (inst<2, 2, true, 1>()), (inst<3, 2, true, 1>()), (GemvFn) nullptr },
     { (inst<1, 2, true, 2>()), (inst<2, 2, true, 2>()), (inst<3, 2, true, 2>()), (GemvFn) nullptr },
     { (inst<1, 2, true, 4>()), (inst<2, 2, true, 4>()), (inst<3, 2, true, 4>()), (GemvFn) nullptr },
     { (inst<1, 2, true, 8>()), (inst<2, 2, true, 8>()), (inst<3, 2, true, 8>()), (GemvFn) nullptr },
+    { (inst<1, 2, true, 16>()), (inst<2, 2, true, 16>()), (inst<3, 2, true, 16>()), (GemvFn) nullptr },
 };
 #undef G__
 
 static int m_index(int m)
 {
-    return m == 1 ? 0 : m == 2 ? 1 : m == 4 ? 2 : 3;
+    return m == 1 ? 0 : m == 2 ? 1 : m == 4 ? 2 : m == 8 ? 3 : 4;
 }
 
-// Fused EXL3 GEMV: C = A_had @ dequant(trellis), replacing the reconstruct + GEMM pair.
-// A_had must already be the input Hadamard (+ suh); C is left for the caller to Hadamard (+ svh).
+// Fused EXL3 GEMV: C = hadamard_svh(A_had @ dequant(trellis)), replacing the
+// reconstruct + GEMM pair. A_had must already be the input Hadamard (+ suh); the output
+// Hadamard (+ svh) runs in the gemv_finalize epilogue, so C is complete on return.
 void exl3_gemv
 (
     const half* A_had,
@@ -228,7 +287,8 @@ void exl3_gemv
     int size_k,
     float K,
     bool mcg,
-    bool mul1
+    bool mul1,
+    const half* svh
 )
 {
     const auto bits = bits_from_K(K);
@@ -239,7 +299,8 @@ void exl3_gemv
     const int64_t packed_blocks_n = B.size(1);
     TORCH_CHECK(size_n % GEMV_N_TILE == 0, "gemv: N must be divisible by ", GEMV_N_TILE);
     TORCH_CHECK(size_k % (16 * GEMV_K_SPLIT) == 0, "gemv: K must be divisible by ", 16 * GEMV_K_SPLIT);
-    TORCH_CHECK(size_m == 1 || size_m == 2 || size_m == 4 || size_m == 8, "gemv: M must be 1/2/4/8");
+    TORCH_CHECK(size_m == 1 || size_m == 2 || size_m == 4 || size_m == 8 || size_m == 16,
+               "gemv: M must be 1/2/4/8/16");
 
     const int mi = m_index(size_m);
     GemvFn fn;
@@ -257,8 +318,15 @@ void exl3_gemv
         fn = gemv_plain[mi][Kb - 1];
     TORCH_CHECK(fn != nullptr, "gemv: no kernel instance");
 
-    const int splits = (int) (size_k / (16 * GEMV_K_SPLIT));
     const int n_chunks = (int) (size_n / GEMV_N_TILE);
+
+    // Adaptive split-K: the fp32 partials round-trip HBM once per split, so use no more
+    // splits than needed to fill the device. The split count must divide size_k/16 (an
+    // integer tile count per CTA); the walk always terminates at size_k/16.
+    int splits = std::max<int64_t>(1, (GEMV_TARGET_CTAS + n_chunks - 1) / n_chunks);
+    splits = std::min(splits, size_k / (16 * GEMV_K_SPLIT));
+    while ((size_k / 16) % splits) ++splits;
+    const int kt_max = (size_k / 16) / splits;
 
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
     auto options = at::TensorOptions().dtype(at::kFloat).device(B.device());
@@ -271,14 +339,20 @@ void exl3_gemv
     int k_dim_i = size_k;
     int n_dim_i = (int) size_n;
     int pbn_i = (int) packed_blocks_n;
+    int kt_max_i = kt_max;
     void* args[] = { (void*)&a_ptr, (void*)&b_ptr, (void*)&cp_ptr,
-                     (void*)&k_dim_i, (void*)&n_dim_i, (void*)&pbn_i };
+                     (void*)&k_dim_i, (void*)&n_dim_i, (void*)&pbn_i, (void*)&kt_max_i };
     hipLaunchKernel(reinterpret_cast<const void*>(fn), dim3(n_chunks, splits),
                     dim3(GEMV_THREADS), args, 0, stream);
     hip_check(hipGetLastError());
 
+    // Fused split-K reduce + output Hadamard (+ svh) epilogue -> C.
     dim3 grid_r(n_chunks, size_m);
-    gemv_reduce_kernel<<<grid_r, dim3(GEMV_N_TILE), 0, stream>>>(
-        C_partial.data_ptr<float>(), C, (int) size_n, size_m, splits);
+    if (svh != nullptr)
+        gemv_finalize_kernel<true><<<grid_r, dim3(32), 0, stream>>>(
+            C_partial.data_ptr<float>(), C, svh, (int) size_n, size_m, splits);
+    else
+        gemv_finalize_kernel<false><<<grid_r, dim3(32), 0, stream>>>(
+            C_partial.data_ptr<float>(), C, nullptr, (int) size_n, size_m, splits);
     hip_check(hipGetLastError());
 }
