@@ -20,6 +20,12 @@ identical inputs, and diff the tensors. If it matches, that sub-component is exo
 - FLA `chunk_gated_delta_rule` **non-zero `initial_state`** path is wrong on ROCm
   (max_abs_diff 4.34; zero-state matches). Bites prefix-caching / multi-turn /
   resumed state — **not** a fresh single-seq prefill (state is zeroed there).
+  **RESOLVED 10-03 (ticket #12): false alarm on the current stack.** The 4.34 diff
+  was against a stale reference generated on nvidia-0's *older* vLLM image, whose
+  FLA had a real h0-path bug (o stage) since fixed upstream. Current ROCm output
+  matches the true gated-delta-rule math (three independent implementations agree,
+  plus an E2E prefix-cache A/B on rocm-1). See the 2026-10-03 section at the
+  bottom. `dbg/fla2_cuda.pt` is a **bad reference** — do not use it for compares.
 
 **Still OPEN (never run standalone on both images) — the fresh-prefill bug is here:**
 1. **int8 embedding** (`orcasaq2/heads.py`) — affects every token; cheapest test.
@@ -183,9 +189,17 @@ Conv (all INCONCLUSIVE — see "post-compaction" section):
 - `dbg/sitecustomize.py` — live debug harness (bind-mounted into `orca-rope-debug`;
   `docker restart` to reload).
 
-FLA / chunk (the confirmed non-zero-init bug):
+FLA / chunk (ticket #12 — RESOLVED 10-03, see bottom; `fla2_cuda.pt` is a BAD
+reference from the old nvidia-0 image):
 - `dbg/test_fla.py`, `test_fla_chunk.py` + `fla_rocm.pt`, `fla_cuda.pt` — chunk test.
 - `dbg/test_fla2.py` + `fla2_rocm.pt`, `fla2_cuda.pt` — non-zero-init isolation.
+- `dbg2/fla_chunk_bisect.py` — stage-level chunk bisect vs independent torch
+  reference (args: `T tag g_scale w_scale h0_scale h0_dtype`).
+- `dbg2/fla_recurrence_check.py` — naive per-token fp32 recurrence (ground truth)
+  vs ROCm output and vs the saved CUDA reference.
+- `dbg2/fla_three_way.py` — chunk vs decode (Triton) vs recurrence, same inputs.
+- `dbg2/gdn_prefix_ab.py` — E2E prefix-cache A/B (cold / hit / cold-after-restart)
+  against the live server (args: `phase1|phase2 [base_url]`).
 - `dbg/test_fla3.py` — decode (invalid, zeros both backends).
 - `dbg/test_fla4.py` + `test_fla4ref.py` — `fused_post_conv_prep` (correct).
 - `dbg/test_exl3gemm.py`, `test_l2norm.py`, `probe_*.py` — misc probes.
@@ -277,3 +291,60 @@ the **int8 embedding** compare is cheaper — do it first if quick.
 - Scratch: `test_conv_cmp.py/2/3.py` (conv cmp, all inconclusive),
   `test_fla2.py` + `fla2_rocm.pt`/`fla2_cuda.pt` (chunk bug), `test_fla3.py`
   (decode, invalid/zeros), `test_fla4.py` + `/tmp/fla4ref.py` (post_conv).
+
+---
+---
+
+## 2026-10-03 — ticket #12 RESOLVED: the h0 "bug" is a false alarm on the current stack
+
+**Bottom line: the current ROCm (vLLM 0.30.x) FLA `chunk_gated_delta_rule`
+non-zero-`initial_state` path is correct.** The 4.34 mismatch found on 09-29 was
+against a stale/bad CUDA reference (`dbg/fla2_cuda.pt`), not against the true
+math. The saved reference was generated on nvidia-0's *older* vLLM image, whose
+vendored FLA had a real h0-path bug (in the o stage) that has since been fixed
+upstream.
+
+### Evidence
+
+1. **Unit** (dev box `orcasaq2-gemv-dev`, card 0, seed 1234, Hq=16 Hv=48 K=V=128):
+   - Current ROCm chunk kernel (non-zero h0) vs an independent naive per-token
+     fp32 torch recurrence (transcribed from the production decode kernel):
+     max_abs **0.0082** — pure bf16 rounding. Holds at T=16/48/64/80/256
+     (partial chunks, full chunks, 4-chunk state chain) with both fp32 and bf16
+     h0 (`dbg2/fla_chunk_bisect.py`, `dbg2/fla_recurrence_check.py`).
+   - Three-way: chunk (Triton) vs fused-recurrent decode (Triton, the production
+     decode path, non-zero h0) vs naive torch recurrence — all agree within bf16
+     (chunk-vs-decode max 0.0156; each vs recurrence ≤ 0.0082).
+     (`dbg2/fla_three_way.py`)
+   - Every intermediate stage (h chain, v_new, final_state, o) matches an
+     independent stage-by-stage reference; `h[0] == h0` bitwise in every run.
+   - **Saved CUDA reference vs the same naive recurrence: max_abs 4.3488, 45% of
+     elements off.** The "reference" is the one that is wrong.
+   - Cross-check across the saved session-1 pairs: `fla_cuda.pt`/`fla_rocm.pt`
+     (h0 non-zero, model shapes) — final states agree across images (0.0063,
+     bf16 noise) while o diverges by 4.34; zero-state o (`fla2` oB/oC) agrees
+     (0.0039). The cross-image divergence is specific to the h0 path of the o
+     stage — exactly where the old nvidia-0 FLA differs from the 0.30.0 FLA.
+
+2. **Production E2E** (`orcasaq2-rocm-1`, prefix caching on; cache blocks are
+   1568 tokens due to mamba-page alignment): `dbg2/gdn_prefix_ab.py`
+   - 3818-token prompt. Cold run A (zero-state prefill). Warm run B:
+     `vllm:prefix_cache_hits_total` jumped by **3136** (2 full blocks) → the tail
+     682 tokens were prefilled with **non-zero initial_state** (multi-chunk h0
+     path).
+   - A and B outputs (reasoning + answer, greedy, 270 tokens) are
+     **byte-identical**; after a container restart, cold run C is also
+     byte-identical. All four factual questions about the cached prefix were
+     answered correctly.
+
+### What this means
+- Nothing to fix on the ROCm side; no FLA patch needs baking into the image.
+- The h0 path is verified for T=16..256, fp32/bf16 state, partial + full +
+  multi-chunk. The `dbg2/` harnesses are committed as the regression suite.
+- nvidia-0's older image may still carry the old h0 bug — its multi-turn /
+  prefix-hit output could be wrong. Not verifiable from here (no-touch
+  container). If the CUDA card's multi-turn matters, re-run
+  `dbg2/fla_recurrence_check.py` and `dbg2/gdn_prefix_ab.py` there and
+  regenerate the references.
+- `dbg/fla2_cuda.pt` (and the o parts of `fla_cuda.pt`) are **bad references** —
+  kept as evidence, do not use them for comparisons.
