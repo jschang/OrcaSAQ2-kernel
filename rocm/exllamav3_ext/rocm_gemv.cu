@@ -455,8 +455,38 @@ void exl3_gemv
     // integer tile count per CTA); the walk always terminates at size_k/16.
     int splits = std::max<int64_t>(1, (GEMV_TARGET_CTAS + n_chunks - 1) / n_chunks);
     splits = std::min(splits, size_k / (16 * GEMV_K_SPLIT));
+
+    // The M<=8 staged kernel (ticket #14) keeps the CTA's x slice -- M * kt_max * 16
+    // halves of dynamic smem -- on top of the static s_packed/s_tile/s_acc. On GPUs with
+    // a small per-CU LDS budget (gfx1100: 64 KB) too few splits overflows the launch and
+    // dies with hipErrorInvalidValue (crash #19: 5120 x 248320 lm_head at M=8 ->
+    // splits=1, kt_max=320, 80 KB). Bound the split count from the budget.
+    bool staged = (size_m <= 8);
+    int smem_limit = 0, static_smem = 0;
+    if (staged)
+    {
+        smem_limit = at::cuda::getCurrentDeviceProperties()->sharedMemPerBlock;
+        const int packed_size = 16 * Kb + (half_k ? 8 : 0);
+        static_smem = 8 * (packed_size / 2) * (int) sizeof(uint32_t)
+                    + 16 * 8 * 8 * (int) sizeof(half2)
+                    + size_m * GEMV_N_TILE * (int) sizeof(float);
+        const int64_t budget = (int64_t) smem_limit - static_smem;
+        TORCH_CHECK(budget > 0, "gemv: device LDS (", smem_limit, " B) is below the staged ",
+                    "kernel's static smem (", static_smem, " B) at M=", size_m);
+        // Dynamic smem with splits=1; each additional split divides the per-CTA stage.
+        const int64_t dyn_total = (int64_t) size_m * (size_k / 16) * 16 * (int) sizeof(half);
+        const int64_t min_splits = (dyn_total + budget - 1) / budget;
+        // min_splits can never exceed the size_k/256 cap for M<=8 (it would need <14 KB
+        // of LDS), so the cap is a formality; the TORCH_CHECK below still guards it.
+        splits = (int) std::max<int64_t>(splits, std::min<int64_t>(min_splits,
+                                                                   size_k / (16 * GEMV_K_SPLIT)));
+    }
     while ((size_k / 16) % splits) ++splits;
     const int kt_max = (size_k / 16) / splits;
+    TORCH_CHECK(!staged ||
+                (int64_t) size_m * kt_max * 16 * (int) sizeof(half) <= (int64_t) smem_limit - static_smem,
+                "gemv: staged dynamic smem (", (int64_t) size_m * kt_max * 16 * sizeof(half),
+                " B) still exceeds the device LDS budget (", smem_limit, " B)");
 
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
     auto options = at::TensorOptions().dtype(at::kFloat).device(B.device());
@@ -464,7 +494,7 @@ void exl3_gemv
 
     // Launch via the function pointer (<<<>>> only works for named kernels).
     // M <= 8 uses the staged kernel, whose dynamic smem holds the CTA's x slice.
-    const size_t dyn_smem = (size_m <= 8) ? (size_t) size_m * kt_max * 16 * sizeof(half) : 0;
+    const size_t dyn_smem = staged ? (size_t) size_m * kt_max * 16 * sizeof(half) : 0;
     const half* a_ptr = A_had;
     const uint16_t* b_ptr = (const uint16_t*) B.data_ptr();
     float* cp_ptr = C_partial.data_ptr<float>();
