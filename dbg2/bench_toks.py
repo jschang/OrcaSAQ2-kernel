@@ -1,22 +1,28 @@
 """Single-stream decode tok/s vs the vLLM server (streams, times first->last token)."""
+import os
 import sys, time, json
 import urllib.request
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else "8000"
 MAXTOK = int(sys.argv[2]) if len(sys.argv) > 2 else 128
+MODEL = os.environ.get("BENCH_MODEL", "orca")
+API_KEY = os.environ.get("BENCH_API_KEY", "")
 URL = f"http://127.0.0.1:{PORT}/v1/completions"
 
 prompt = ("Write a short poem about the ocean. ")
 
 body = json.dumps({
-    "model": "orca",
+    "model": MODEL,
     "prompt": prompt,
     "max_tokens": MAXTOK,
     "temperature": 0.0,
     "stream": True,
 }).encode()
 
-req = urllib.request.Request(URL, data=body, headers={"Content-Type": "application/json"})
+headers = {"Content-Type": "application/json"}
+if API_KEY:
+    headers["Authorization"] = f"Bearer {API_KEY}"
+req = urllib.request.Request(URL, data=body, headers=headers)
 t0 = time.time()
 first = None
 last = None

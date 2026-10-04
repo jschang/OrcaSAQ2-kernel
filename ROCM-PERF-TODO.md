@@ -143,9 +143,20 @@ Result (done):
   matched ~252-token prompt): GEMV family 48.71 -> 47.57 ms/tok, host gap 6.20 -> 4.95
   ms/tok (404 fewer launches/step), wall 62.80 -> 61.48 ms/tok (15.9 -> 16.3 tok/s
   profiled). Correctness cos=1.000000 all shapes.
-- Next (unmeasured): the partial kernels now read the packed trellis at ~0.71 TB/s
-  effective; GEMV is ~82% of GPU-busy, so the remaining GEMV lever is that read (wider
-  dequant / packed-FMA). Attention + GDN are the next largest terms per the #7 profile.
+- Ticket #14 (done): the 0.71 TB/s figure above was wrong — the partial kernel runs at
+  0.07-0.21 TB/s effective (dbg2/gemv_bw.py): latency/ALU-bound (~2.3-3.2 us/tile vs ~1 us
+  HBM-only), not bandwidth-bound. A mode-matrix bench (dbg2/gemv_bench.py, MODE 0-4; MODE 0
+  and the staged variant verified ISA-identical to the production kernels by disassembly)
+  splits the M=1 qkv cost: dequant ALU ~40%, FMA ~40%, x read/staging ~20%. Shipped
+  `gemv_partial_staged_kernel` (rocm_gemv.cu): the x slice is staged in smem once per tile
+  and the FMA runs as v_dot2_f32_f16 column pairs for M in {1,2,4,8} (M=16 keeps the HBM-x
+  path; the stage crushes occupancy at 16 rows). Per-op two-build A/B: 0..-3.1% (M=1, the
+  x slice is only ~20% of the cost); E2E +2.5% (17.03 -> 17.46 tok/s on rocm-1, 252-token
+  decode, non-overlapping runs, drift-checked). Measurement caveat: standalone per-kernel
+  bench on this box is session-drift-dominated — ISA-identical kernels drift +/-25%
+  between sessions and the staged/old ratio flips direction — so only same-context
+  production A/B and E2E count. Next lever: the dequant ALU (~40% of GEMV time): wider
+  dequant / packed-FMA. Attention + GDN remain the next largest terms per the #7 profile.
 
 ## P2 — deferred (deprioritized by the checkpoint histogram)
 

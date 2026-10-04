@@ -17,3 +17,7 @@ third_party/vllm-rocm-debug/
 rocm/exllamav3_ext/*.hip
 rocm/exllamav3_ext/quant/*.hip
 rocm/exllamav3_ext/arch_hip.cuh
+
+# dbg2 bench: torch hipify regenerates dbg2/bench_gemv.hip from bench_gemv.cu when
+# build_bench.py runs; deleting it forces a regen on the next build.
+dbg2/*.hip

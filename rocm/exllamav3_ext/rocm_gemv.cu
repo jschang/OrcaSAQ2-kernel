@@ -10,6 +10,8 @@
 //   gemv_partial:  split-K; each CTA owns (128 cols) x (kt_max k-tiles of 16 rows), writes an
 //                  fp32 partial. The split count is adaptive (see exl3_gemv): just enough CTAs
 //                  to fill the device, since each split adds an HBM round trip of the partials.
+//                  M <= 8 runs the smem-staged variant (x slice staged once, v_dot2 column
+//                  pairs); M = 16 keeps the HBM-x FMA because the stage would crush occupancy.
 //   gemv_finalize: sums the partials over the K splits and runs the output 128-point Hadamard
 //                  (+ svh post-scale) in the same kernel -> fp16 C. Replaces the reduce kernel
 //                  plus the separate had_r_128 launch (and the fp16 C round trip between them).
@@ -35,6 +37,24 @@
 // ~a full wave of the partial kernel: gfx1100 has 80 CUs x up to 8 workgroups = 640
 // concurrent CTAs; targeting 512 keeps every shape's CTA count near (not far above) one wave.
 #define GEMV_TARGET_CTAS 512
+
+// fp32-accumulate dot of two packed half2 pairs: a.x*b.x + a.y*b.y + c. The f16 products are
+// exact in f32. On RDNA this is the single v_dot2_f32_f16 instruction (each uint32 holds two
+// halves in lo:hi register order); other targets fall back to an explicit FMA pair.
+__device__ __forceinline__ float dot2_f32(uint32_t a, uint32_t b, float c)
+{
+#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1034__) \
+    || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1151__)
+    float r;
+    asm("v_dot2_f32_f16 %0, %1, %2, %3\n" : "=v"(r) : "v"(a), "v"(b), "v"(c));
+    return r;
+#else
+    half2 ha = *(const half2*) &a;
+    half2 hb = *(const half2*) &b;
+    return fmaf(__half2float(__low2half(ha)), __half2float(__low2half(hb)),
+                fmaf(__half2float(__high2half(ha)), __half2float(__high2half(hb)), c));
+#endif
+}
 
 // Dequant one 16(k) x 128(n) tile into row-major smem s_tile[16][8][8] (half2), reusing the exact
 // reconstruct_tile dequant + shuffle. g_packed points at the first of the 8 consecutive (k, n) tiles.
@@ -167,6 +187,111 @@ void gemv_partial_kernel
     }
 }
 
+// M <= 8 variant of the partial kernel: the CTA's x slice is staged once in dynamic smem and
+// dotted via v_dot2 column pairs. The x rows would otherwise be re-fetched from HBM/L2 on every
+// 16-row k-tile -- the packed weight stream evicts them from L1, so each tile's FMA waits on
+// L2 latency -- and v_dot2 halves the FMA instruction count. Bench-validated on all four decode
+// shapes at M=1 (qkv -39%, gate -3%, down -1%, q -6%), and a win or tie on every shape through
+// M=8. At M = 16 the stage grows to 20-40 KB per CTA and crushes occupancy, so the M = 16
+// instances keep the HBM-x kernel above.
+template <int K, int cb, bool HALF, int M>
+__global__ __launch_bounds__(GEMV_THREADS)
+void gemv_partial_staged_kernel
+(
+    const half* __restrict__ g_a_had,     // (M, k_dim) input (already Hadamard + suh)
+    const uint16_t* __restrict__ g_packed, // trellis
+    float* __restrict__ g_c_partial,      // (splits, M, n_dim) fp32
+    int k_dim,
+    int n_dim,
+    int packed_blocks_n,
+    int kt_max                             // 16-row k-tiles owned by this CTA = (k_dim/16)/splits
+)
+{
+    constexpr int packed_size = 16 * K + (HALF ? 8 : 0);
+
+    int t = threadIdx.x;
+    int lane_id = t % 32;
+    int warp_id = t / 32;
+    int k0 = blockIdx.y * kt_max;                  // first 16-row k-tile index for this CTA
+    int n0 = blockIdx.x * (GEMV_N_TILE / 16);      // first n-tile index (8 per CTA)
+
+    __shared__ uint32_t s_packed[8][packed_size / 2];
+    __shared__ half2 s_tile[16][8][8];
+    __shared__ float s_acc[M][GEMV_N_TILE];
+    extern __shared__ half s_x_flat[];  // [M][kt_max*16] x slice, sized by the host launch
+
+    for (int i = t; i < M * GEMV_N_TILE; i += GEMV_THREADS)
+        ((float*) s_acc)[i] = 0.0f;
+    // Stage the CTA's x slice: s_x_flat[m * kt_max*16 + r] = A_had[m, k0*16 + r].
+    for (int i = t; i < M * kt_max * 16; i += GEMV_THREADS)
+        s_x_flat[i] = g_a_had[(int64_t) (i / (kt_max * 16)) * k_dim + k0 * 16 + i % (kt_max * 16)];
+    __syncthreads();
+
+    float acc[M], acc1[M];  // the pair's columns (2cp, 2cp+1)
+    #pragma unroll
+    for (int m = 0; m < M; m++) { acc[m] = 0.0f; acc1[m] = 0.0f; }
+
+    g_packed += ((int64_t) k0 * packed_blocks_n + n0) * packed_size;
+
+    for (int kt = 0; kt < kt_max; kt++)
+    {
+        gemv_dequant_tile<K, cb, HALF>((half2*) s_tile, (uint32_t*) s_packed, g_packed, t, lane_id, warp_id);
+        g_packed += (int64_t) packed_blocks_n * packed_size;
+
+        // Column-pair ownership: threads t < GEMV_N_TILE (128) each own 2 adjacent columns x
+        // 8 k-rows: cp indexes the 64 column pairs, kh picks the row half (rows 0-7 / 8-15).
+        if (t < GEMV_N_TILE)
+        {
+            int cp = t % (GEMV_N_TILE / 2);       // column pair (columns 2cp, 2cp+1)
+            int kh = t / (GEMV_N_TILE / 2);      // row half (0: rows 0-7, 1: rows 8-15)
+            int nw = (2 * cp) / 16;
+            int nh = ((2 * cp) % 16) / 2;
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+            {
+                half2 w2a = s_tile[kh * 8 + 2 * j][nw][nh];       // (w[2j][2cp],   w[2j][2cp+1])
+                half2 w2b = s_tile[kh * 8 + 2 * j + 1][nw][nh];   // (w[2j+1][2cp], w[2j+1][2cp+1])
+                uint32_t ua = *(const uint32_t*) &w2a;
+                uint32_t ub = *(const uint32_t*) &w2b;
+                uint32_t w_lo = (ua & 0xffff) | (ub << 16);        // (w[2j][2cp],   w[2j+1][2cp])
+                uint32_t w_hi = (ua >> 16) | (ub & 0xffff0000);    // (w[2j][2cp+1], w[2j+1][2cp+1])
+                #pragma unroll
+                for (int m = 0; m < M; m++)
+                {
+                    // s_x_flat is indexed in half2 units: half (kt*16 + kh*8 + 2j) -> (kt*8 + kh*4 + j).
+                    uint32_t x2 = *(const uint32_t*) (((half2*) s_x_flat) + m * kt_max * 8 + kt * 8 + kh * 4 + j);
+                    acc[m] = dot2_f32(x2, w_lo, acc[m]);
+                    acc1[m] = dot2_f32(x2, w_hi, acc1[m]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (t < GEMV_N_TILE)
+    {
+        int cp = t % (GEMV_N_TILE / 2);
+        #pragma unroll
+        for (int m = 0; m < M; m++)
+        {
+            atomicAdd(&s_acc[m][2 * cp], acc[m]);
+            atomicAdd(&s_acc[m][2 * cp + 1], acc1[m]);
+        }
+    }
+    __syncthreads();
+
+    if (t < GEMV_N_TILE)
+    {
+        int cp = t % (GEMV_N_TILE / 2);
+        #pragma unroll
+        for (int m = 0; m < M; m++)
+        {
+            g_c_partial[((int64_t) blockIdx.y * M + m) * n_dim + blockIdx.x * GEMV_N_TILE + 2 * cp] = s_acc[m][2 * cp];
+            g_c_partial[((int64_t) blockIdx.y * M + m) * n_dim + blockIdx.x * GEMV_N_TILE + 2 * cp + 1] = s_acc[m][2 * cp + 1];
+        }
+    }
+}
+
 // Fused split-K reduce + output-Hadamard epilogue.
 //
 // C_partial (splits, M, N) fp32 -> C (M, N) fp16, one CTA per (128-col block, row): each lane
@@ -234,41 +359,46 @@ void gemv_finalize_kernel
 using GemvFn = void (*)(const half*, const uint16_t*, float*, int, int, int, int);
 template <int K, int cb, bool HALF, int M>
 static GemvFn inst() { return (GemvFn) gemv_partial_kernel<K, cb, HALF, M>; }
+template <int K, int cb, bool HALF, int M>
+static GemvFn inst_staged() { return (GemvFn) gemv_partial_staged_kernel<K, cb, HALF, M>; }
 
+// M rows 0-3 (M = 1/2/4/8) dispatch to the smem-staged kernel; M = 16 keeps the HBM-x kernel.
 #define G__(k, c, m) (inst<k, c, false, m>())
+#define GS__(k, c, m) (inst_staged<k, c, false, m>())
 static const GemvFn gemv_plain[5][8] =
 {
-    { G__(1, 0, 1), G__(2, 0, 1), G__(3, 0, 1), G__(4, 0, 1), G__(5, 0, 1), G__(6, 0, 1), G__(7, 0, 1), G__(8, 0, 1) },
-    { G__(1, 0, 2), G__(2, 0, 2), G__(3, 0, 2), G__(4, 0, 2), G__(5, 0, 2), G__(6, 0, 2), G__(7, 0, 2), G__(8, 0, 2) },
-    { G__(1, 0, 4), G__(2, 0, 4), G__(3, 0, 4), G__(4, 0, 4), G__(5, 0, 4), G__(6, 0, 4), G__(7, 0, 4), G__(8, 0, 4) },
-    { G__(1, 0, 8), G__(2, 0, 8), G__(3, 0, 8), G__(4, 0, 8), G__(5, 0, 8), G__(6, 0, 8), G__(7, 0, 8), G__(8, 0, 8) },
+    { GS__(1, 0, 1), GS__(2, 0, 1), GS__(3, 0, 1), GS__(4, 0, 1), GS__(5, 0, 1), GS__(6, 0, 1), GS__(7, 0, 1), GS__(8, 0, 1) },
+    { GS__(1, 0, 2), GS__(2, 0, 2), GS__(3, 0, 2), GS__(4, 0, 2), GS__(5, 0, 2), GS__(6, 0, 2), GS__(7, 0, 2), GS__(8, 0, 2) },
+    { GS__(1, 0, 4), GS__(2, 0, 4), GS__(3, 0, 4), GS__(4, 0, 4), GS__(5, 0, 4), GS__(6, 0, 4), GS__(7, 0, 4), GS__(8, 0, 4) },
+    { GS__(1, 0, 8), GS__(2, 0, 8), GS__(3, 0, 8), GS__(4, 0, 8), GS__(5, 0, 8), GS__(6, 0, 8), GS__(7, 0, 8), GS__(8, 0, 8) },
     { G__(1, 0, 16), G__(2, 0, 16), G__(3, 0, 16), G__(4, 0, 16), G__(5, 0, 16), G__(6, 0, 16), G__(7, 0, 16), G__(8, 0, 16) },
 };
 static const GemvFn gemv_mcg[5][8] =
 {
-    { G__(1, 1, 1), G__(2, 1, 1), G__(3, 1, 1), G__(4, 1, 1), G__(5, 1, 1), G__(6, 1, 1), G__(7, 1, 1), G__(8, 1, 1) },
-    { G__(1, 1, 2), G__(2, 1, 2), G__(3, 1, 2), G__(4, 1, 2), G__(5, 1, 2), G__(6, 1, 2), G__(7, 1, 2), G__(8, 1, 2) },
-    { G__(1, 1, 4), G__(2, 1, 4), G__(3, 1, 4), G__(4, 1, 4), G__(5, 1, 4), G__(6, 1, 4), G__(7, 1, 4), G__(8, 1, 4) },
-    { G__(1, 1, 8), G__(2, 1, 8), G__(3, 1, 8), G__(4, 1, 8), G__(5, 1, 8), G__(6, 1, 8), G__(7, 1, 8), G__(8, 1, 8) },
+    { GS__(1, 1, 1), GS__(2, 1, 1), GS__(3, 1, 1), GS__(4, 1, 1), GS__(5, 1, 1), GS__(6, 1, 1), GS__(7, 1, 1), GS__(8, 1, 1) },
+    { GS__(1, 1, 2), GS__(2, 1, 2), GS__(3, 1, 2), GS__(4, 1, 2), GS__(5, 1, 2), GS__(6, 1, 2), GS__(7, 1, 2), GS__(8, 1, 2) },
+    { GS__(1, 1, 4), GS__(2, 1, 4), GS__(3, 1, 4), GS__(4, 1, 4), GS__(5, 1, 4), GS__(6, 1, 4), GS__(7, 1, 4), GS__(8, 1, 4) },
+    { GS__(1, 1, 8), GS__(2, 1, 8), GS__(3, 1, 8), GS__(4, 1, 8), GS__(5, 1, 8), GS__(6, 1, 8), GS__(7, 1, 8), GS__(8, 1, 8) },
     { G__(1, 1, 16), G__(2, 1, 16), G__(3, 1, 16), G__(4, 1, 16), G__(5, 1, 16), G__(6, 1, 16), G__(7, 1, 16), G__(8, 1, 16) },
 };
 static const GemvFn gemv_mul1[5][8] =
 {
-    { G__(1, 2, 1), G__(2, 2, 1), G__(3, 2, 1), G__(4, 2, 1), G__(5, 2, 1), G__(6, 2, 1), G__(7, 2, 1), G__(8, 2, 1) },
-    { G__(1, 2, 2), G__(2, 2, 2), G__(3, 2, 2), G__(4, 2, 2), G__(5, 2, 2), G__(6, 2, 2), G__(7, 2, 2), G__(8, 2, 2) },
-    { G__(1, 2, 4), G__(2, 2, 4), G__(3, 2, 4), G__(4, 2, 4), G__(5, 2, 4), G__(6, 2, 4), G__(7, 2, 4), G__(8, 2, 4) },
-    { G__(1, 2, 8), G__(2, 2, 8), G__(3, 2, 8), G__(4, 2, 8), G__(5, 2, 8), G__(6, 2, 8), G__(7, 2, 8), G__(8, 2, 8) },
+    { GS__(1, 2, 1), GS__(2, 2, 1), GS__(3, 2, 1), GS__(4, 2, 1), GS__(5, 2, 1), GS__(6, 2, 1), GS__(7, 2, 1), GS__(8, 2, 1) },
+    { GS__(1, 2, 2), GS__(2, 2, 2), GS__(3, 2, 2), GS__(4, 2, 2), GS__(5, 2, 2), GS__(6, 2, 2), GS__(7, 2, 2), GS__(8, 2, 2) },
+    { GS__(1, 2, 4), GS__(2, 2, 4), GS__(3, 2, 4), GS__(4, 2, 4), GS__(5, 2, 4), GS__(6, 2, 4), GS__(7, 2, 4), GS__(8, 2, 4) },
+    { GS__(1, 2, 8), GS__(2, 2, 8), GS__(3, 2, 8), GS__(4, 2, 8), GS__(5, 2, 8), GS__(6, 2, 8), GS__(7, 2, 8), GS__(8, 2, 8) },
     { G__(1, 2, 16), G__(2, 2, 16), G__(3, 2, 16), G__(4, 2, 16), G__(5, 2, 16), G__(6, 2, 16), G__(7, 2, 16), G__(8, 2, 16) },
 };
 static const GemvFn gemv_half[5][4] =
 {
-    { (inst<1, 2, true, 1>()), (inst<2, 2, true, 1>()), (inst<3, 2, true, 1>()), (GemvFn) nullptr },
-    { (inst<1, 2, true, 2>()), (inst<2, 2, true, 2>()), (inst<3, 2, true, 2>()), (GemvFn) nullptr },
-    { (inst<1, 2, true, 4>()), (inst<2, 2, true, 4>()), (inst<3, 2, true, 4>()), (GemvFn) nullptr },
-    { (inst<1, 2, true, 8>()), (inst<2, 2, true, 8>()), (inst<3, 2, true, 8>()), (GemvFn) nullptr },
+    { (inst_staged<1, 2, true, 1>()), (inst_staged<2, 2, true, 1>()), (inst_staged<3, 2, true, 1>()), (GemvFn) nullptr },
+    { (inst_staged<1, 2, true, 2>()), (inst_staged<2, 2, true, 2>()), (inst_staged<3, 2, true, 2>()), (GemvFn) nullptr },
+    { (inst_staged<1, 2, true, 4>()), (inst_staged<2, 2, true, 4>()), (inst_staged<3, 2, true, 4>()), (GemvFn) nullptr },
+    { (inst_staged<1, 2, true, 8>()), (inst_staged<2, 2, true, 8>()), (inst_staged<3, 2, true, 8>()), (GemvFn) nullptr },
     { (inst<1, 2, true, 16>()), (inst<2, 2, true, 16>()), (inst<3, 2, true, 16>()), (GemvFn) nullptr },
 };
 #undef G__
+#undef GS__
 
 static int m_index(int m)
 {
@@ -333,6 +463,8 @@ void exl3_gemv
     at::Tensor C_partial = at::empty({splits, size_m, size_n}, options);
 
     // Launch via the function pointer (<<<>>> only works for named kernels).
+    // M <= 8 uses the staged kernel, whose dynamic smem holds the CTA's x slice.
+    const size_t dyn_smem = (size_m <= 8) ? (size_t) size_m * kt_max * 16 * sizeof(half) : 0;
     const half* a_ptr = A_had;
     const uint16_t* b_ptr = (const uint16_t*) B.data_ptr();
     float* cp_ptr = C_partial.data_ptr<float>();
@@ -343,7 +475,7 @@ void exl3_gemv
     void* args[] = { (void*)&a_ptr, (void*)&b_ptr, (void*)&cp_ptr,
                      (void*)&k_dim_i, (void*)&n_dim_i, (void*)&pbn_i, (void*)&kt_max_i };
     hipLaunchKernel(reinterpret_cast<const void*>(fn), dim3(n_chunks, splits),
-                    dim3(GEMV_THREADS), args, 0, stream);
+                    dim3(GEMV_THREADS), args, dyn_smem, stream);
     hip_check(hipGetLastError());
 
     // Fused split-K reduce + output Hadamard (+ svh) epilogue -> C.
