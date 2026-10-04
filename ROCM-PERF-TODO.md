@@ -92,6 +92,76 @@ size the GDN/attention remainder for later work.
 
 ## P1 — the main fish: fused decode GEMM (est. ~3x on the GEMM share)
 
+### G2. Large-M / prefill GEMM: fuse or keep rocBLAS? `evaluated — NO-GO for now (2026-10-03, ticket #11)`
+The ticket premise: for rows > GEMM_MAX_ROWS (144) the ROCm path reconstructs the full
+weight tile to fp16 in HBM per call (`rocm_gemm.cu hgemm_recon`) — the same waste the G1
+GEMV eliminated for decode. Measure TTFT, per-layer GEMM time at large M, and evaluate
+porting the upstream fused cooperative-groups EXL3 GEMM.
+
+Measurements (dev box, 24 GB gfx1100 0x744c — same SKU class as rocm-1; rocm-1 serving
+MAXLEN=8192 MAXBATCHTOK=2048, prefix cache on, warm):
+- **TTFT (fresh prompts, cache-hit counter verified +0):** 2048 tok -> 1.73 s (~1185 tok/s);
+  8050 tok -> 7.97 s (~1010 tok/s). (Prompt must leave ~77 tok for the chat template +
+  16 max_tokens under MAXLEN=8192.) Cache-hit case: 2048 tok with 1568 cached -> 0.57 s.
+  Harness: `dbg2/ttft_bench.py [base_url] [seed_offset]` — unique seeds per run or the
+  prefix cache short-circuits the prefill.
+- **Per-op unfused path at M=128/512/2048** (`dbg2/gemm_m_sweep.py`, ms per call):
+
+  | shape (K->N) | role | M=128 | M=512 | M=2048 |
+  |---|---|---|---|---|
+  | 5120->1024  | k/v_proj     | 0.122 | 0.123 | 0.388 |
+  | 5120->6144  | in_proj_z    | 0.206 | 0.461 | 1.731 |
+  | 5120->10240 | in_proj_qkv  | 0.426 | 0.844 | 2.921 |
+  | 5120->12288 | q_proj       | 0.494 | 1.005 | 3.498 |
+  | 5120->17408 | gate/up_proj | 0.714 | 1.420 | 4.871 |
+  | 6144->5120  | out_proj/o_proj | 0.220 | 0.488 | 1.725 |
+  | 17408->5120 | down_proj    | 0.730 | 1.467 | 5.398 |
+
+  (lm_head 5120->248320, 6-bit, skipped — one row in production; OOMs the dev card at
+  M=512 standalone.)
+
+  At M=2048 per 2048-token pass: GDN layer 21.53 ms x 48 = 1033 ms; attention layer
+  6.00 ms x 16 = 96 ms; **GEMM stage total ~1129 ms = ~65% of the 1730 ms TTFT**, the
+  remaining ~600 ms is GDN/attention compute + norms + chunk overhead (next ticket).
+- **Roofline** (`dbg2/gemm_fp16_peak.py`): pure fp16 torch matmul on this card does
+  81.8-83.5 TFLOP at M=2048, 94.2 at M=4096. The EXL3 hgemm_recon (rocBLAS) runs at
+  **85 TFLOP** — i.e. the current GEMM call is already at the card's fp16 ceiling.
+
+Analysis:
+- The fusion-able overhead at M=2048 is dequant (reconstruct round trip) ~60 ms +
+  Hadamard in/out ~105 ms = ~165 ms ~ 14.6% of the GEMM stage ~ 9.5% of TTFT, best case.
+- A fused kernel must match rocBLAS to realize that; on RDNA3 the dequant ALU shares the
+  VALU pipe with the FMA (G1's mode-matrix: dequant ALU is ~40% of GEMV time at M=1), so
+  a realistic fused kernel lands at ~70-80 TFLOP vs rocBLAS 85 -> net wash or slightly
+  negative (965 ms compute at 85 TFLOP -> ~1020-1170 ms fused vs 1130 ms current).
+- Expected TTFT delta: -2%..+6%. Not worth a multi-week kernel project today.
+
+Upstream kernel anatomy (for the record; `upstream/exllamav3/exllamav3/exllamav3/
+exllamav3_ext/quant/exl3_gemm{.cu,_kernel.cuh,_inner.cuh}`, MIT):
+- One cooperative launch (`cudaLaunchCooperativeKernel`, one block per SM); the grid
+  slices the (k,n) tile space; M is handled by a `while` loop over **16-row slabs with a
+  full grid.sync() between each** (128 syncs at M=2048), re-streaming the whole weight
+  per slab from L2 (fits: per-GEMM weights span ~2-37 MB quantized, ~95 MB for lm_head,
+  all < 128 MB RDNA3 L2).
+- Dot runs on PTX `mma.sync` m16n8k16/m8n8k4 (tensor cores), `ldmatrix` (ldsm4) fragment
+  loads, `cp.async` global->smem prefetch, GPU-scoped `red`/fence barrier locks — none of
+  which exist on RDNA3/HIP. A literal port = WMMA fragment rewrite + manual LDS swizzle +
+  plain-load staging + cooperative-launch validation (HIP supports it on gfx1100 but it is
+  untested here). That is the heavy path; a from-scratch RDNA3 blocked GEMM (smem dequant
+  tile + WMMA m16n16k16, no grid sync, each CTA owns all M-rows for its (k,n) tile — the
+  design that also removes the L2 re-stream) is the light path but has to beat rocBLAS to
+  pay for itself, which the numbers above say it will not at M=2048.
+
+Verdict / revisit criteria:
+- NO-GO now. Keep rocBLAS for M > 144.
+- Revisit if: (a) rocBLAS fp16 regresses below ~70 TFLOP on this card; (b) an fp8/int8
+  GEMM path lands and the dequant becomes the cost; (c) mid-M (17-144) becomes common —
+  e.g. MTP/spec decoding enabled (P3/M1), where dequant is ~40% of the M=128 GEMM stage
+  and a mid-M fused kernel would win clearly; (d) we need to fuse the Hadamard in/out
+  launches for launch-count reasons (moot under graph capture).
+- If ever picked up, building blocks are in hand: `reconstruct_tile` smem dequant (G1),
+  `gemv_finalize` Hadamard epilogue, upstream kernel as the algorithm reference.
+
 ### G1. Replace the unfused exl3_gemm with a fused GEMV for small M. `done`
 On ROCm, `exl3_gemm` (`rocm/exllamav3_ext/rocm_gemm.cu:60`) is a stand-in: input
 Hadamard → `reconstruct` the **entire weight tile into a fresh fp16 matrix in HBM**
