@@ -121,6 +121,14 @@ ARGS=(--model "$MODEL" --served-model-name "$NAME" --port "$PORT" --host "${BIND
 [ -n "${OLEVEL:-}" ] && ARGS+=(-O"$OLEVEL")
 [ -n "${CGSIZES:-}" ] && ARGS+=(--cuda-graph-sizes "$CGSIZES")
 [ "${EAGER:-0}" = "1" ] && ARGS+=(--enforce-eager)
+# CUDA graph mode. The -O1 default is PIECEWISE: vLLM captures piecewise cudagraphs for
+# prefill as well, and on ROCm a fresh prefill of ~60k+ tokens deadlocks the engine in an
+# HSA signal wait -- GPU goes idle, stats stop, the API times out, and the freeze lasts
+# minutes to hours (ticket #37, reproduced on gfx942, ROCm 7.2.3, vLLM 0.30.0).
+# FULL_DECODE_ONLY keeps the decode full-graphs (the big win) and runs prefill eager; the
+# 100k-token repro that never completes at the default finishes in ~7 min with it.
+# Values: NONE PIECEWISE FULL FULL_DECODE_ONLY FULL_AND_PIECEWISE.
+[ -n "${CUDAGRAPH_MODE:-}" ] && ARGS+=(--compilation-config "{\"cudagraph_mode\":\"$CUDAGRAPH_MODE\"}")
 [ -n "${SWAP:-}" ] && ARGS+=(--swap-space "$SWAP")
 # KV offload: a second and third tier under the GPU pool. It does NOT shrink one sequence's
 # active attention window -- that still has to fit in VRAM -- but it lets evicted blocks and
